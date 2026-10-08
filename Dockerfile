@@ -6,7 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg curl ca-certificates \
+    ffmpeg curl ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # yt-dlp uses Deno for YouTube's JavaScript challenge support.
