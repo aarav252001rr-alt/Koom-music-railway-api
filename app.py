@@ -94,6 +94,8 @@ def _get_ydl_opts(extra: Optional[dict] = None) -> dict:
         "noplaylist": True,
         "extract_flat": False,
         "socket_timeout": 30,
+        # Prefer an audio-only source, but fall back to any playable format.
+        "format": "bestaudio/best",
     }
     if os.path.isfile(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
