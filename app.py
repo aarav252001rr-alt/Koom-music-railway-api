@@ -130,9 +130,29 @@ def _quality_label(abr: Optional[float]) -> str:
     return f"{int(abr)} kbps (Very Low)"
 
 
+def normalize_youtube_url(url: str) -> str:
+    """Normalize YouTube Music URLs to standard YouTube watch URLs before extraction."""
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host in {"music.youtube.com", "m.youtube.com", "youtube.com", "www.youtube.com"}:
+        query = parse_qs(parsed.query)
+        video_id = (query.get("v") or [None])[0]
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+    if host in {"youtu.be", "www.youtu.be"}:
+        video_id = parsed.path.strip("/").split("/")[0]
+        if video_id:
+            return f"https://www.youtube.com/watch?v={video_id}"
+    return url
+
+
 def fetch_video_info(url: str) -> dict:
+    # Avoid YouTube Music's page/client route when extracting stream formats.
+    normalized_url = normalize_youtube_url(url)
     with yt_dlp.YoutubeDL(_get_ydl_opts()) as ydl:
-        return ydl.extract_info(url, download=False)
+        return ydl.extract_info(normalized_url, download=False)
 
 
 def extract_audio_formats(info: dict) -> List[Dict[str, Any]]:
@@ -188,8 +208,9 @@ async def _extract_direct(url: str, format_id: str) -> tuple[dict, dict]:
     selected = find_format(data, format_id)
     if not selected:
         raise HTTPException(400, f"Audio format '{format_id}' is not available")
+    normalized_url = normalize_youtube_url(url)
     opts = _get_ydl_opts({"format": selected["format_id"], "noplaylist": True})
-    resolved = await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(opts).extract_info(url, download=False))
+    resolved = await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(opts).extract_info(normalized_url, download=False))
     direct = next((f.get("url") for f in resolved.get("formats", []) or [] if str(f.get("format_id")) == selected["format_id"]), None)
     if not direct:
         direct = resolved.get("url")
