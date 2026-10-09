@@ -1,32 +1,24 @@
-# KOOM Downloader API v2
+# KOOM source-format audio API
 
-Railway/Render-ready FastAPI + yt-dlp + FFmpeg backend.
+Railway deployment for a FastAPI + yt-dlp audio API.
 
-## New features
-- `format_id=best` automatically selects the highest real audio-only source available.
-- `/info` and `/formats` expose real audio source quality; no fake 192/256 kbps labels.
-- `/stream` supports audio-only playback and optional conversion.
-- `/download` creates a metadata-aware downloadable file (default MP3).
-- Downloaded MP3/M4A files include title, artist, album and cover art when thumbnail retrieval succeeds.
-- Download filename uses the real title instead of a random token.
-- `download_url` is separate from playback `stream_url` while preserving simple integration.
+## Changes
+- `/stream/{token}` proxies the exact selected yt-dlp audio format; no Opus-to-MP3 or other live transcoding.
+- `/download/{token}` uses yt-dlp's native downloader for the selected format and attempts to embed metadata and cover art. No forced MP3 conversion.
+- `/info` and `/formats` report source audio formats.
+- Stream proxy forwards yt-dlp's per-format HTTP headers and Range requests for seeking.
+- Cookies are not included in this repository; do not commit browser cookies or credentials.
 
-## Environment variables
-- `API_KEY` optional
-- `PUBLIC_BASE_URL` recommended on Railway, e.g. `https://your-service.up.railway.app`
-- `STREAM_TTL=300`
-- `DOWNLOAD_TTL=900`
-- `COOKIES_FILE=/app/cookies.txt` optional; never commit private cookies
+## Deploy
+Push these files to a GitHub repository and deploy that repository on Railway. Railway should build with the included Dockerfile.
 
-## Example
-POST `/stream`
-```json
-{"url":"https://www.youtube.com/watch?v=VIDEO_ID","format_id":"best"}
-```
+## Endpoints
+- `GET /health`
+- `GET /info?url=<YouTube URL>`
+- `GET /formats?url=<YouTube URL>`
+- `POST /stream` with `{ "url": "https://www.youtube.com/watch?v=...", "format_id": "251" }`
+- `GET /stream/{token}`
+- `POST /download` with the same request shape
+- `GET /download/{token}`
 
-POST `/download`
-```json
-{"url":"https://www.youtube.com/watch?v=VIDEO_ID","format_id":"best","convert_to":"mp3"}
-```
-
-The download response contains `download_url`, `filename`, `title`, `artist`, `album`, `thumbnail`, and `source_quality`.
+`convert_to` remains accepted for compatibility with old clients but is ignored. The output always uses the selected source format. Metadata/thumbnail embedding depends on source container support and the available FFmpeg/yt-dlp postprocessors.
