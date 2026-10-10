@@ -192,8 +192,16 @@ def _cookie_path() -> Optional[str]:
 # player clients are treated differently, so we try several and remember the one that works.
 _VARIANTS = ([{"name": "env:" + ",".join(EXTRA_CLIENTS), "args": {"youtube": {"player_client": EXTRA_CLIENTS}}, "cookies": True}] if EXTRA_CLIENTS else []) + [
     {"name": "default", "args": None, "cookies": True},
-    {"name": "tv", "args": {"youtube": {"player_client": ["tv"]}}, "cookies": True},
     {"name": "mweb", "args": {"youtube": {"player_client": ["mweb"]}}, "cookies": True},
+    {"name": "web", "args": {"youtube": {"player_client": ["web"]}}, "cookies": True},
+    # Logged-in accounts can be put in YouTube's "SABR-only" experiment (direct URLs then 403). A logged-out
+    # session is not part of that, and PO tokens come from the bgutil provider - so try cookie-less too.
+    {"name": "mweb-nocookie", "args": {"youtube": {"player_client": ["mweb"]}}, "cookies": False},
+    {"name": "web-nocookie", "args": {"youtube": {"player_client": ["web"]}}, "cookies": False},
+    {"name": "default-nocookie", "args": None, "cookies": False},
+    {"name": "tv_simply", "args": {"youtube": {"player_client": ["tv_simply"]}}, "cookies": False},
+    {"name": "web_creator", "args": {"youtube": {"player_client": ["web_creator"]}}, "cookies": True},
+    {"name": "tv", "args": {"youtube": {"player_client": ["tv"]}}, "cookies": True},
     {"name": "web_safari", "args": {"youtube": {"player_client": ["web_safari"]}}, "cookies": True},
     {"name": "android_vr", "args": {"youtube": {"player_client": ["android_vr"]}}, "cookies": False},
 ]
@@ -446,14 +454,14 @@ async def diag(url: str = Query("https://www.youtube.com/watch?v=dQw4w9WgXcQ")):
 
         class Cap:                       # capture only PO-token / plugin related yt-dlp debug output
             def debug(self, m):
-                if re.search(r"pot|bgutil|plugin|po token", str(m), re.I) and len(lines) < 14:
+                if re.search(r"pot|bgutil|plugin|po token|sabr|n challenge|nsig|skipp", str(m), re.I) and len(lines) < 14:
                     lines.append(str(m)[:200])
             def info(self, m): pass
             def warning(self, m):
                 if len(lines) < 14: lines.append("W " + str(m)[:200])
             def error(self, m):
                 if len(lines) < 14: lines.append("E " + str(m)[:200])
-        res = {"client": _VARIANTS[n]["name"]}
+        res = {"client": _VARIANTS[n]["name"], "cookies": _VARIANTS[n]["cookies"]}
         try:
             with yt_dlp.YoutubeDL(_get_ydl_opts({"ignore_no_formats_error": True, "logger": Cap(), "verbose": True}, n)) as ydl:
                 info = ydl.extract_info(url, download=False)
