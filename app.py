@@ -198,6 +198,10 @@ _VARIANTS = ([{"name": "env:" + ",".join(EXTRA_CLIENTS), "args": {"youtube": {"p
     {"name": "tv_simply", "args": {"youtube": {"player_client": ["tv_simply"]}}, "cookies": False},
     {"name": "default-nocookie", "args": None, "cookies": False},
     {"name": "mweb-nocookie", "args": {"youtube": {"player_client": ["mweb"]}}, "cookies": False},
+    # these tracks come from YouTube Music, so its own web client is worth a try (needs the PO-token provider)
+    {"name": "web_music-nocookie", "args": {"youtube": {"player_client": ["web_music"]}}, "cookies": False},
+    {"name": "web_embedded-nocookie", "args": {"youtube": {"player_client": ["web_embedded"]}}, "cookies": False},
+    {"name": "tv-nocookie", "args": {"youtube": {"player_client": ["tv"]}}, "cookies": False},
     # cookie-based clients stay as a last-resort fallback (e.g. if YouTube starts demanding sign-in again)
     {"name": "default", "args": None, "cookies": True},
     {"name": "mweb", "args": {"youtube": {"player_client": ["mweb"]}}, "cookies": True},
@@ -312,7 +316,7 @@ def _extract(url: str, extra: Optional[dict] = None) -> dict:
                 info = ydl.extract_info(url, download=False)
             if extra is None and not extract_audio_formats(info):
                 reason = f"availability={info.get('availability')}, age_limit={info.get('age_limit')}, live={info.get('live_status')}"
-                hint = " | ".join(notes[-2:])
+                hint = " | ".join(dict.fromkeys(n[:150] for n in notes))[:520]   # all distinct yt-dlp warnings, in order
                 raise RuntimeError(f"no audio formats returned by this client ({reason})" + (f": {hint}" if hint else "") +
                                    ("" if JS_RUNTIME else " - NO JavaScript runtime installed (deno/node)"))
             if extra is None:
