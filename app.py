@@ -30,6 +30,8 @@ DOWNLOAD_TTL = int(os.getenv("DOWNLOAD_TTL", "900"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/koom-downloads")
+PROXY = os.getenv("YTDLP_PROXY", "").strip()          # optional: http(s)/socks5 proxy for YouTube (residential works best)
+EXTRA_CLIENTS = [c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") if c.strip()]
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 TOKENS: Dict[str, Dict[str, Any]] = {}
@@ -114,7 +116,22 @@ def _cookie_path() -> Optional[str]:
     return _COOKIES_RUNTIME or None
 
 
-def _get_ydl_opts(extra: Optional[dict] = None) -> dict:
+# YouTube often answers "Sign in to confirm you're not a bot" to datacenter IPs. Different yt-dlp
+# player clients are treated differently, so we try several and remember the one that works.
+_VARIANTS = ([{"name": "env:" + ",".join(EXTRA_CLIENTS), "args": {"youtube": {"player_client": EXTRA_CLIENTS}}, "cookies": True}] if EXTRA_CLIENTS else []) + [
+    {"name": "default", "args": None, "cookies": True},
+    {"name": "tv", "args": {"youtube": {"player_client": ["tv"]}}, "cookies": True},
+    {"name": "mweb", "args": {"youtube": {"player_client": ["mweb"]}}, "cookies": True},
+    {"name": "web_safari", "args": {"youtube": {"player_client": ["web_safari"]}}, "cookies": True},
+    {"name": "android_vr", "args": {"youtube": {"player_client": ["android_vr"]}}, "cookies": False},
+]
+_VARIANT = 0
+_RETRY_HINTS = ("sign in", "not a bot", "confirm you", "http error 403", "po token", "no audio formats",
+                "requested format", "unavailable", "player response")
+
+
+def _get_ydl_opts(extra: Optional[dict] = None, variant: Optional[int] = None) -> dict:
+    v = _VARIANTS[_VARIANT if variant is None else variant]
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -124,11 +141,38 @@ def _get_ydl_opts(extra: Optional[dict] = None) -> dict:
         "socket_timeout": 30,
     }
     cookies = _cookie_path()
-    if cookies:
+    if cookies and v["cookies"]:
         opts["cookiefile"] = cookies
+    if v["args"]:
+        opts["extractor_args"] = v["args"]
+    if PROXY:
+        opts["proxy"] = PROXY
     if extra:
         opts.update(extra)
     return opts
+
+
+def _extract(url: str, extra: Optional[dict] = None) -> dict:
+    """extract_info with automatic player-client fallback; remembers the winning client."""
+    global _VARIANT
+    order = [_VARIANT] + [n for n in range(len(_VARIANTS)) if n != _VARIANT]
+    last: Optional[Exception] = None
+    for n in order:
+        try:
+            with yt_dlp.YoutubeDL(_get_ydl_opts(extra, n)) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if extra is None and not extract_audio_formats(info):
+                raise RuntimeError("no audio formats returned by this client")
+            if n != _VARIANT:
+                logger.info("yt-dlp client switched to %s", _VARIANTS[n]["name"])
+            _VARIANT = n
+            return info
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if not any(h in str(e).lower() for h in _RETRY_HINTS):
+                raise
+            logger.warning("yt-dlp client %s failed: %s", _VARIANTS[n]["name"], str(e)[:160])
+    raise last  # type: ignore[misc]
 
 
 def _clean_filename(title: str, ext: str) -> str:
@@ -160,8 +204,7 @@ def _quality_label(abr: Optional[float]) -> str:
 
 
 def fetch_video_info(url: str) -> dict:
-    with yt_dlp.YoutubeDL(_get_ydl_opts()) as ydl:
-        return ydl.extract_info(url, download=False)
+    return _extract(url)
 
 
 def extract_audio_formats(info: dict) -> List[Dict[str, Any]]:
@@ -223,8 +266,7 @@ async def _extract_direct(url: str, format_id: str) -> tuple[dict, dict]:
     selected = find_format(data, format_id)
     if not selected:
         raise HTTPException(400, f"Audio format '{format_id}' is not available")
-    opts = _get_ydl_opts({"format": selected["format_id"], "noplaylist": True})
-    resolved = await asyncio.to_thread(lambda: yt_dlp.YoutubeDL(opts).extract_info(url, download=False))
+    resolved = await asyncio.to_thread(_extract, url, {"format": selected["format_id"], "noplaylist": True})
     # With a format selector, yt-dlp may return the selected format at top level.
     chosen = next((f for f in (resolved.get("formats", []) or []) if str(f.get("format_id")) == selected["format_id"]), None)
     direct = (chosen or {}).get("url") or resolved.get("url")
@@ -241,6 +283,40 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": "2.0.0", "time": int(time.time())}
+
+@app.get("/diag", dependencies=[Depends(verify_key)])
+async def diag(url: str = Query("https://www.youtube.com/watch?v=dQw4w9WgXcQ")):
+    """Why does extraction fail? Tries every yt-dlp client separately and reports cookie health (names only)."""
+    cp = _cookie_path()
+    names = set()
+    if cp:
+        try:
+            for line in open(cp, encoding="utf-8", errors="ignore"):
+                p = line.rstrip("\n").split("\t")
+                if len(p) >= 7 and not line.startswith("#") and "youtube" in p[0] + "google":
+                    names.add(p[5])
+        except Exception:
+            pass
+    key_cookies = ["LOGIN_INFO", "SAPISID", "__Secure-3PSID", "__Secure-1PSID", "SID", "HSID"]
+    out = {
+        "yt_dlp_version": getattr(yt_dlp.version, "__version__", "?"),
+        "cookies_file": COOKIES_FILE, "cookies_loaded": bool(cp), "cookie_count": len(names),
+        "login_cookies_present": {k: (k in names) for k in key_cookies},
+        "proxy_configured": bool(PROXY), "attempts": [],
+    }
+    def run(n):
+        try:
+            with yt_dlp.YoutubeDL(_get_ydl_opts(None, n)) as ydl:
+                info = ydl.extract_info(url, download=False)
+            return {"client": _VARIANTS[n]["name"], "ok": True, "audio_formats": len(extract_audio_formats(info))}
+        except Exception as e:  # noqa: BLE001
+            return {"client": _VARIANTS[n]["name"], "ok": False, "error": str(e)[:200]}
+    for n in range(len(_VARIANTS)):
+        out["attempts"].append(await asyncio.to_thread(run, n))
+    out["verdict"] = ("works" if any(x["ok"] for x in out["attempts"]) else
+                      "all clients blocked: YouTube is rejecting this server's IP/cookies (use a proxy or run the API from a home/VPS IP)")
+    return out
+
 
 @app.get("/info", response_model=InfoResponse, dependencies=[Depends(verify_key)])
 async def info(url: str = Query(...)):
@@ -325,7 +401,7 @@ async def _proxy_bytes(direct_url: str, ext: str, request: Request, title: str, 
     if request.headers.get("range"):
         headers["Range"] = request.headers["range"]
     mime = {"m4a":"audio/mp4","mp3":"audio/mpeg","opus":"audio/ogg","webm":"audio/webm","ogg":"audio/ogg","flac":"audio/flac","wav":"audio/wav","aac":"audio/aac"}.get(ext, "application/octet-stream")
-    client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+    client = httpx.AsyncClient(timeout=60.0, follow_redirects=True, proxy=PROXY or None)
     resp = await client.send(client.build_request("GET", direct_url, headers=headers), stream=True)
     if resp.status_code not in (200, 206):
         await resp.aclose(); await client.aclose(); raise HTTPException(502, f"Upstream error {resp.status_code}")
