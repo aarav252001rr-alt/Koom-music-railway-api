@@ -572,6 +572,12 @@ async def create_stream(req: StreamRequest, request: Request):
         "artist": _artist(data), "album": _album(data), "thumbnail": data.get("thumbnail"),
         "duration": data.get("duration"), "track": data.get("track") or title,
     }
+    # We already hold the playable googlevideo URL from this extraction: hand it to GET /stream/{token}
+    # so it does not run yt-dlp two more times (this cut ~6 s from the start of every song).
+    raw = next((f for f in data.get("formats") or [] if str(f.get("format_id")) == selected["format_id"] and f.get("url")), None)
+    if raw:
+        TOKENS[token]["direct"] = {"t": time.time(), "url": raw["url"], "ext": selected["ext"],
+                                   "h": raw.get("http_headers") or data.get("http_headers") or {}}
     b = base_url(request)
     return StreamResponse(
         stream_url=f"{b}/stream/{token}", expires_in=STREAM_TTL, format_id=selected["format_id"], ext=selected["ext"],
@@ -620,6 +626,9 @@ async def _proxy_bytes(direct_url: str, ext: str, request: Request, title: str, 
         if k in resp.headers: h["Content-Length" if k == "content-length" else "Content-Range"] = resp.headers[k]
     return StreamingResponse(streamer(), status_code=resp.status_code, headers=h, media_type=mime)
 
+_THUMB_OK = {"mp3", "m4a", "mp4", "m4v", "mov", "ogg", "opus", "flac", "mka", "mkv"}
+
+
 async def _download_tagged(item: dict, output_fmt: str) -> str:
     """Download the chosen yt-dlp format as-is, then embed metadata/cover when supported."""
     work = tempfile.mkdtemp(prefix="koom-")
@@ -631,14 +640,23 @@ async def _download_tagged(item: dict, output_fmt: str) -> str:
             "format": item["format_id"],
             "outtmpl": outtmpl,
             "noplaylist": True,
-            "writethumbnail": True,
-            "postprocessors": [
-                {"key": "FFmpegMetadata", "add_metadata": True},
-                {"key": "EmbedThumbnail"},
-            ],
+            # yt-dlp can only embed cover art into these containers; WebM (Opus) is NOT one of them.
+            "writethumbnail": item.get("output_fmt") in _THUMB_OK,
+            "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True}] +
+                              ([{"key": "EmbedThumbnail"}] if item.get("output_fmt") in _THUMB_OK else []),
         })
         # Run yt-dlp's own downloader rather than fetching googlevideo URLs separately.
-        await asyncio.to_thread(lambda: _download_with_ydl(item["url"], opts))
+        try:
+            await asyncio.to_thread(lambda: _download_with_ydl(item["url"], opts))
+        except Exception as e:  # noqa: BLE001
+            if "postprocess" not in str(e).lower():
+                raise
+            # Tagging/cover embedding failed but the audio is fine: retry as a plain download.
+            logger.warning("Post-processing failed (%s) - retrying without tags", str(e)[:120])
+            for f in Path(work).glob("*"):
+                f.unlink(missing_ok=True)
+            opts.pop("postprocessors", None); opts["writethumbnail"] = False
+            await asyncio.to_thread(lambda: _download_with_ydl(item["url"], opts))
         candidates = [p for p in Path(work).glob("source.*") if p.is_file() and not p.name.endswith((".jpg", ".jpeg", ".png", ".webp", ".json"))]
         if not candidates:
             raise HTTPException(502, "yt-dlp did not produce an audio file")
