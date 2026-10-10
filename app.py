@@ -293,15 +293,28 @@ def _get_ydl_opts(extra: Optional[dict] = None, variant: Optional[int] = None) -
 def _extract(url: str, extra: Optional[dict] = None) -> dict:
     """extract_info with automatic player-client fallback; remembers the winning client."""
     global _VARIANT
+    have_cookies = bool(_cookie_path())
     order = [_VARIANT] + [n for n in range(len(_VARIANTS)) if n != _VARIANT]
+    order = [n for n in order if have_cookies or not _VARIANTS[n]["cookies"]] or order   # no cookies loaded -> skip cookie variants
     last: Optional[Exception] = None
     for n in order:
+        notes: list = []
+
+        class Cap:                      # keep yt-dlp's own explanation (it is our best clue why formats are missing)
+            def debug(self, m): pass
+            def info(self, m): pass
+            def warning(self, m): notes.append(str(m)[:170])
+            def error(self, m): notes.append(str(m)[:170])
         try:
-            with yt_dlp.YoutubeDL(_get_ydl_opts(extra if extra is not None else {"ignore_no_formats_error": True}, n)) as ydl:
+            opts = _get_ydl_opts(extra if extra is not None else {"ignore_no_formats_error": True}, n)
+            opts["logger"] = Cap()
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             if extra is None and not extract_audio_formats(info):
-                raise RuntimeError("no audio formats returned by this client" + ("" if JS_RUNTIME else
-                                   " - NO JavaScript runtime installed (deno/node): YouTube formats cannot be unlocked"))
+                reason = f"availability={info.get('availability')}, age_limit={info.get('age_limit')}, live={info.get('live_status')}"
+                hint = " | ".join(notes[-2:])
+                raise RuntimeError(f"no audio formats returned by this client ({reason})" + (f": {hint}" if hint else "") +
+                                   ("" if JS_RUNTIME else " - NO JavaScript runtime installed (deno/node)"))
             if extra is None:
                 ok, why = _probe_playable(info)
                 if not ok:
@@ -312,9 +325,9 @@ def _extract(url: str, extra: Optional[dict] = None) -> dict:
             return info
         except Exception as e:  # noqa: BLE001
             last = e
+            logger.warning("yt-dlp client %s failed for %s: %s", _VARIANTS[n]["name"], url, str(e)[:260])
             if not any(h in str(e).lower() for h in _RETRY_HINTS):
                 raise
-            logger.warning("yt-dlp client %s failed: %s", _VARIANTS[n]["name"], str(e)[:160])
     raise last  # type: ignore[misc]
 
 
