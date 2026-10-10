@@ -10,6 +10,7 @@ import secrets
 import logging
 import tempfile
 import shutil
+from pathlib import Path   # FIX: was missing -> /download/{token} crashed with NameError
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -86,6 +87,33 @@ class StreamResponse(BaseModel):
     filename: Optional[str] = None
 
 
+_COOKIES_RUNTIME: Optional[str] = None
+
+
+def _cookie_path() -> Optional[str]:
+    """Return a private, writable copy of the cookies file (or None).
+
+    yt-dlp re-saves its cookie jar on exit, so a read-only or root-owned
+    /app/cookies.txt raises "Permission denied". We copy it once to /tmp and
+    never let a cookie problem break extraction: on any error run cookie-less.
+    """
+    global _COOKIES_RUNTIME
+    if _COOKIES_RUNTIME is not None:
+        return _COOKIES_RUNTIME or None
+    _COOKIES_RUNTIME = ""
+    try:
+        if os.path.isfile(COOKIES_FILE):
+            dst = os.path.join(tempfile.gettempdir(), "koom-cookies.txt")
+            shutil.copyfile(COOKIES_FILE, dst)
+            os.chmod(dst, 0o600)
+            _COOKIES_RUNTIME = dst
+            logger.info("Cookies loaded from %s", COOKIES_FILE)
+    except Exception as e:  # PermissionError, OSError...
+        logger.warning("Cannot use cookies file %s (%s) - continuing without cookies. "
+                       "Fix: chmod 644 the file or mount it readable by uid 1000.", COOKIES_FILE, e)
+    return _COOKIES_RUNTIME or None
+
+
 def _get_ydl_opts(extra: Optional[dict] = None) -> dict:
     opts = {
         "quiet": True,
@@ -95,8 +123,9 @@ def _get_ydl_opts(extra: Optional[dict] = None) -> dict:
         "extract_flat": False,
         "socket_timeout": 30,
     }
-    if os.path.isfile(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
+    cookies = _cookie_path()
+    if cookies:
+        opts["cookiefile"] = cookies
     if extra:
         opts.update(extra)
     return opts
@@ -175,8 +204,13 @@ def extract_audio_formats(info: dict) -> List[Dict[str, Any]]:
 
 def find_format(info: dict, format_id: str) -> Optional[dict]:
     formats = extract_audio_formats(info)
-    if format_id.lower() in {"best", "auto", "highest"}:
+    fid = format_id.lower()
+    if fid in {"best", "auto", "highest", "high"}:
         return formats[0] if formats else None
+    if formats and fid in {"standard", "medium"}:
+        return formats[len(formats) // 2]
+    if formats and fid in {"low", "lowest"}:
+        return formats[-1]
     return next((f for f in formats if f["format_id"] == format_id), None)
 
 
@@ -274,9 +308,13 @@ async def proxy_stream(token: str, request: Request):
     if not item or item.get("expires", 0) < time.time():
         TOKENS.pop(token, None)
         raise HTTPException(410, "Stream expired or not found")
-    data, selected = await _extract_direct(item["url"], item["format_id"])
-    return await _proxy_bytes(selected["url"], selected["ext"], request, item["title"], download=False,
-                              upstream_headers=selected.get("http_headers") or {})
+    # Reuse the resolved googlevideo URL for a few minutes: browsers send several Range requests per
+    # track (seeking), and re-running yt-dlp for each one made playback slow to start.
+    hit = item.get("direct")
+    if not hit or hit["t"] < time.time() - 240:
+        _, selected = await _extract_direct(item["url"], item["format_id"])
+        hit = item["direct"] = {"t": time.time(), "url": selected["url"], "ext": selected["ext"], "h": selected.get("http_headers") or {}}
+    return await _proxy_bytes(hit["url"], hit["ext"], request, item["title"], download=False, upstream_headers=hit["h"])
 
 async def _proxy_bytes(direct_url: str, ext: str, request: Request, title: str, download: bool = False,
                        upstream_headers: Optional[dict] = None):
