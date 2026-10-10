@@ -44,6 +44,9 @@ def _norm_pot_url(u: str) -> str:
 
 
 POT_BASE_URL = _norm_pot_url(os.getenv("POT_BASE_URL", ""))      # optional bgutil PO-token provider, e.g. http://pot.railway.internal:4416
+# googlevideo URLs are bound to the IP that created them; Railway's outbound IP rotates within a small pool, so a
+# 403 is often just "different egress IP". A fresh connection may leave from the right one - retry a few times.
+EGRESS_RETRIES = max(1, int(os.getenv("EGRESS_RETRIES", "8")))
 PROXY = os.getenv("YTDLP_PROXY", "").strip()          # optional: http(s)/socks5 proxy for YouTube (residential works best)
 EXTRA_CLIENTS = [c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") if c.strip()]
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -211,7 +214,8 @@ def _ping_pot() -> str:
 
 
 def _probe_playable(info: dict) -> "tuple[bool, str]":
-    """Request 2 bytes of the best direct audio URL: googlevideo answers 403 when a client needs a PO token."""
+    """Request 2 bytes of the best direct audio URL (googlevideo answers 403 for PO-token / wrong-IP problems)."""
+    from urllib.parse import urlsplit, parse_qs
     raws = [f for f in info.get("formats") or [] if f.get("url") and f.get("vcodec") in (None, "none")
             and f.get("acodec") not in (None, "none") and "m3u8" not in str(f.get("protocol", ""))]
     if not raws:
@@ -220,11 +224,29 @@ def _probe_playable(info: dict) -> "tuple[bool, str]":
     h = dict(f.get("http_headers") or info.get("http_headers") or {})
     h.setdefault("User-Agent", "Mozilla/5.0")
     h["Range"] = "bytes=0-1"
-    try:
-        r = httpx.get(f["url"], headers=h, timeout=12, follow_redirects=True, proxy=PROXY or None)
-        return r.status_code in (200, 206), f"HTTP {r.status_code}"
-    except Exception as e:  # noqa: BLE001
-        return False, str(e)[:100]
+    uip = (parse_qs(urlsplit(f["url"]).query).get("ip") or ["?"])[0]
+    code = "?"
+    for n in range(1, EGRESS_RETRIES + 1):
+        try:
+            r = httpx.get(f["url"], headers=h, timeout=12, follow_redirects=True, proxy=PROXY or None)  # new connection each time
+            code = r.status_code
+            if code in (200, 206):
+                return True, f"HTTP {code} (try {n}, url ip {uip})"
+            if code != 403:
+                break
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)[:100]
+    return False, f"HTTP {code} after {n} tries (url ip {uip})"
+
+
+def _egress_ips(k: int = 6) -> list:
+    out = []
+    for _ in range(k):
+        try:
+            out.append(httpx.get("https://api.ipify.org", timeout=6).text.strip())
+        except Exception:  # noqa: BLE001
+            out.append("?")
+    return out
 
 
 def _get_ydl_opts(extra: Optional[dict] = None, variant: Optional[int] = None) -> dict:
@@ -407,7 +429,7 @@ async def diag(url: str = Query("https://www.youtube.com/watch?v=dQw4w9WgXcQ")):
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "?"),
         "cookies_source": _COOKIES_SRC or None, "cookies_loaded": bool(cp), "cookie_count": len(names),
         "login_cookies_present": {k: (k in names) for k in key_cookies},
-        "proxy_configured": bool(PROXY), "pot_provider": POT_BASE_URL or None, "pot_provider_ping": await asyncio.to_thread(_ping_pot), "js_runtime": JS_RUNTIME or "MISSING - install deno (see Dockerfile)", "attempts": [],
+        "proxy_configured": bool(PROXY), "pot_provider": POT_BASE_URL or None, "pot_provider_ping": await asyncio.to_thread(_ping_pot), "egress_ip_samples": await asyncio.to_thread(_egress_ips), "js_runtime": JS_RUNTIME or "MISSING - install deno (see Dockerfile)", "attempts": [],
     }
     def run(n):
         try:
@@ -513,10 +535,15 @@ async def _proxy_bytes(direct_url: str, ext: str, request: Request, title: str, 
     if request.headers.get("range"):
         headers["Range"] = request.headers["range"]
     mime = {"m4a":"audio/mp4","mp3":"audio/mpeg","opus":"audio/ogg","webm":"audio/webm","ogg":"audio/ogg","flac":"audio/flac","wav":"audio/wav","aac":"audio/aac"}.get(ext, "application/octet-stream")
-    client = httpx.AsyncClient(timeout=60.0, follow_redirects=True, proxy=PROXY or None)
-    resp = await client.send(client.build_request("GET", direct_url, headers=headers), stream=True)
-    if resp.status_code not in (200, 206):
-        await resp.aclose(); await client.aclose(); raise HTTPException(502, f"Upstream error {resp.status_code}")
+    for attempt in range(EGRESS_RETRIES):
+        client = httpx.AsyncClient(timeout=60.0, follow_redirects=True, proxy=PROXY or None)
+        resp = await client.send(client.build_request("GET", direct_url, headers=headers), stream=True)
+        if resp.status_code in (200, 206):
+            break
+        code = resp.status_code
+        await resp.aclose(); await client.aclose()
+        if code != 403 or attempt == EGRESS_RETRIES - 1:
+            raise HTTPException(502, f"Upstream error {code}")
     async def streamer():
         try:
             async for chunk in resp.aiter_bytes(64 * 1024): yield chunk
@@ -534,6 +561,7 @@ async def _download_tagged(item: dict, output_fmt: str) -> str:
         outtmpl = os.path.join(work, "source.%(ext)s")
         opts = _get_ydl_opts({
             "skip_download": False,
+            "retries": EGRESS_RETRIES + 5,
             "format": item["format_id"],
             "outtmpl": outtmpl,
             "noplaylist": True,
