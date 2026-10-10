@@ -31,6 +31,7 @@ DOWNLOAD_TTL = int(os.getenv("DOWNLOAD_TTL", "900"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/koom-downloads")
+POT_BASE_URL = os.getenv("POT_BASE_URL", "").strip()      # optional bgutil PO-token provider, e.g. http://pot.railway.internal:4416
 PROXY = os.getenv("YTDLP_PROXY", "").strip()          # optional: http(s)/socks5 proxy for YouTube (residential works best)
 EXTRA_CLIENTS = [c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") if c.strip()]
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -182,8 +183,25 @@ _VARIANTS = ([{"name": "env:" + ",".join(EXTRA_CLIENTS), "args": {"youtube": {"p
     {"name": "android_vr", "args": {"youtube": {"player_client": ["android_vr"]}}, "cookies": False},
 ]
 _VARIANT = 0
-_RETRY_HINTS = ("sign in", "not a bot", "confirm you", "http error 403", "po token", "no audio formats",
+_RETRY_HINTS = ("not playable", "forbidden", "sign in", "not a bot", "confirm you", "http error 403", "po token", "no audio formats",
                 "requested format", "unavailable", "player response")
+
+
+def _probe_playable(info: dict) -> "tuple[bool, str]":
+    """Request 2 bytes of the best direct audio URL: googlevideo answers 403 when a client needs a PO token."""
+    raws = [f for f in info.get("formats") or [] if f.get("url") and f.get("vcodec") in (None, "none")
+            and f.get("acodec") not in (None, "none") and "m3u8" not in str(f.get("protocol", ""))]
+    if not raws:
+        return False, "no direct audio URLs"
+    f = max(raws, key=lambda x: x.get("abr") or 0)
+    h = dict(f.get("http_headers") or info.get("http_headers") or {})
+    h.setdefault("User-Agent", "Mozilla/5.0")
+    h["Range"] = "bytes=0-1"
+    try:
+        r = httpx.get(f["url"], headers=h, timeout=12, follow_redirects=True, proxy=PROXY or None)
+        return r.status_code in (200, 206), f"HTTP {r.status_code}"
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)[:100]
 
 
 def _get_ydl_opts(extra: Optional[dict] = None, variant: Optional[int] = None) -> dict:
@@ -199,8 +217,11 @@ def _get_ydl_opts(extra: Optional[dict] = None, variant: Optional[int] = None) -
     cookies = _cookie_path()
     if cookies and v["cookies"]:
         opts["cookiefile"] = cookies
-    if v["args"]:
-        opts["extractor_args"] = v["args"]
+    ea = dict(v["args"] or {})
+    if POT_BASE_URL:
+        ea["youtubepot-bgutilhttp"] = {"base_url": [POT_BASE_URL]}
+    if ea:
+        opts["extractor_args"] = ea
     if PROXY:
         opts["proxy"] = PROXY
     if extra:
@@ -220,6 +241,10 @@ def _extract(url: str, extra: Optional[dict] = None) -> dict:
             if extra is None and not extract_audio_formats(info):
                 raise RuntimeError("no audio formats returned by this client" + ("" if JS_RUNTIME else
                                    " - NO JavaScript runtime installed (deno/node): YouTube formats cannot be unlocked"))
+            if extra is None:
+                ok, why = _probe_playable(info)
+                if not ok:
+                    raise RuntimeError(f"media URL not playable ({why}) - YouTube wants a PO token for this client")
             if n != _VARIANT:
                 logger.info("yt-dlp client switched to %s", _VARIANTS[n]["name"])
             _VARIANT = n
@@ -359,13 +384,14 @@ async def diag(url: str = Query("https://www.youtube.com/watch?v=dQw4w9WgXcQ")):
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "?"),
         "cookies_source": _COOKIES_SRC or None, "cookies_loaded": bool(cp), "cookie_count": len(names),
         "login_cookies_present": {k: (k in names) for k in key_cookies},
-        "proxy_configured": bool(PROXY), "js_runtime": JS_RUNTIME or "MISSING - install deno (see Dockerfile)", "attempts": [],
+        "proxy_configured": bool(PROXY), "pot_provider": POT_BASE_URL or None, "js_runtime": JS_RUNTIME or "MISSING - install deno (see Dockerfile)", "attempts": [],
     }
     def run(n):
         try:
             with yt_dlp.YoutubeDL(_get_ydl_opts(None, n)) as ydl:
                 info = ydl.extract_info(url, download=False)
-            return {"client": _VARIANTS[n]["name"], "ok": True, "audio_formats": len(extract_audio_formats(info))}
+            ok, why = _probe_playable(info)
+            return {"client": _VARIANTS[n]["name"], "ok": ok, "audio_formats": len(extract_audio_formats(info)), "media_url": why}
         except Exception as e:  # noqa: BLE001
             return {"client": _VARIANTS[n]["name"], "ok": False, "error": str(e)[:200]}
     for n in range(len(_VARIANTS)):
