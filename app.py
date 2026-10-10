@@ -10,6 +10,7 @@ import secrets
 import logging
 import tempfile
 import shutil
+import threading
 from pathlib import Path   # FIX: was missing -> /download/{token} crashed with NameError
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -89,31 +90,85 @@ class StreamResponse(BaseModel):
     filename: Optional[str] = None
 
 
-_COOKIES_RUNTIME: Optional[str] = None
+# ---- cookies: GitHub repo (preferred) -> local file fallback --------------------------------------
+# Railway variables:
+#   COOKIES_GITHUB_REPO   owner/repo of a PRIVATE repo holding the cookies file
+#   COOKIES_GITHUB_PATH   path inside the repo            (default: cookies.txt)
+#   COOKIES_GITHUB_BRANCH branch                           (default: main)
+#   GITHUB_TOKEN          fine-grained token, ONLY this repo, permission "Contents: Read-only"
+#   COOKIES_REFRESH_SECONDS  re-download interval          (default: 1800) -> update cookies without redeploying
+GH_REPO = os.getenv("COOKIES_GITHUB_REPO", "").strip().strip("/")
+GH_PATH = os.getenv("COOKIES_GITHUB_PATH", "cookies.txt").strip().lstrip("/")
+GH_BRANCH = os.getenv("COOKIES_GITHUB_BRANCH", "main").strip()
+GH_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+GH_REFRESH = int(os.getenv("COOKIES_REFRESH_SECONDS", "1800"))
+GH_ALLOW_PUBLIC = os.getenv("COOKIES_ALLOW_PUBLIC", "") == "1"
+
+_COOKIES_RUNTIME: Optional[str] = None   # None = not loaded yet, "" = none available
+_COOKIES_T = 0.0
+_COOKIES_SRC = ""
+_COOKIES_LOCK = threading.Lock()
+
+
+def _write_private(data: bytes) -> str:
+    """Write cookies to a brand-new private dir (yt-dlp re-saves its jar, so it must be writable)."""
+    dst = os.path.join(tempfile.mkdtemp(prefix="koom-ck-"), "cookies.txt")
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as out:
+        out.write(data)
+    return dst
+
+
+def _fetch_github_cookies() -> Optional[bytes]:
+    if not GH_REPO:
+        return None
+    if not GH_TOKEN and not GH_ALLOW_PUBLIC:
+        logger.error("COOKIES_GITHUB_REPO is set but GITHUB_TOKEN is missing - refusing to fetch cookies "
+                     "anonymously (that would mean a PUBLIC repo with your login cookies). Use a private repo + token.")
+        return None
+    headers = {"Accept": "application/vnd.github.raw+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "koom-downloader"}
+    if GH_TOKEN:
+        headers["Authorization"] = f"Bearer {GH_TOKEN}"
+    r = httpx.get(f"https://api.github.com/repos/{GH_REPO}/contents/{GH_PATH}", params={"ref": GH_BRANCH},
+                  headers=headers, timeout=20, follow_redirects=True)
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub returned HTTP {r.status_code} (check repo name, path, branch and token access)")
+    return r.content
 
 
 def _cookie_path() -> Optional[str]:
-    """Return a private, writable copy of the cookies file (or None).
-
-    yt-dlp re-saves its cookie jar on exit, so a read-only or root-owned
-    /app/cookies.txt raises "Permission denied". We copy it once to /tmp and
-    never let a cookie problem break extraction: on any error run cookie-less.
-    """
-    global _COOKIES_RUNTIME
-    if _COOKIES_RUNTIME is not None:
+    """Path of a private, writable cookies copy, or None. Never raises: cookie problems must not break playback."""
+    global _COOKIES_RUNTIME, _COOKIES_T, _COOKIES_SRC
+    with _COOKIES_LOCK:
+        if _COOKIES_RUNTIME is not None and not (GH_REPO and time.time() - _COOKIES_T > GH_REFRESH):
+            return _COOKIES_RUNTIME or None
+        _COOKIES_T = time.time()
+        data, src = None, ""
+        if GH_REPO:
+            try:
+                data, src = _fetch_github_cookies(), f"github:{GH_REPO}/{GH_PATH}@{GH_BRANCH}"
+            except Exception as e:  # noqa: BLE001
+                logger.warning("GitHub cookies fetch failed: %s", e)
+        if data is None and _COOKIES_RUNTIME:
+            return _COOKIES_RUNTIME                     # refresh failed: keep the last good copy
+        if data is None:
+            try:
+                if os.path.isfile(COOKIES_FILE):
+                    with open(COOKIES_FILE, "rb") as f:
+                        data, src = f.read(), COOKIES_FILE
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Cannot read cookies file %s (%s). Fix: chmod 644 / readable by uid 1000.", COOKIES_FILE, e)
+        if data and b"\t" in data and not data.lstrip().lower().startswith((b"<!doctype", b"<html", b"{")):
+            try:
+                _COOKIES_RUNTIME, _COOKIES_SRC = _write_private(data), src
+                logger.info("Cookies loaded from %s (%d bytes)", src, len(data))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Cannot write private cookies copy: %s", e)
+        elif data:
+            logger.warning("Cookies from %s do not look like a Netscape cookies.txt - ignored", src)
+        if not _COOKIES_RUNTIME:
+            _COOKIES_RUNTIME = ""
         return _COOKIES_RUNTIME or None
-    _COOKIES_RUNTIME = ""
-    try:
-        if os.path.isfile(COOKIES_FILE):
-            dst = os.path.join(tempfile.gettempdir(), "koom-cookies.txt")
-            shutil.copyfile(COOKIES_FILE, dst)
-            os.chmod(dst, 0o600)
-            _COOKIES_RUNTIME = dst
-            logger.info("Cookies loaded from %s", COOKIES_FILE)
-    except Exception as e:  # PermissionError, OSError...
-        logger.warning("Cannot use cookies file %s (%s) - continuing without cookies. "
-                       "Fix: chmod 644 the file or mount it readable by uid 1000.", COOKIES_FILE, e)
-    return _COOKIES_RUNTIME or None
 
 
 # YouTube often answers "Sign in to confirm you're not a bot" to datacenter IPs. Different yt-dlp
@@ -287,7 +342,7 @@ async def health():
 @app.get("/diag", dependencies=[Depends(verify_key)])
 async def diag(url: str = Query("https://www.youtube.com/watch?v=dQw4w9WgXcQ")):
     """Why does extraction fail? Tries every yt-dlp client separately and reports cookie health (names only)."""
-    cp = _cookie_path()
+    cp = await asyncio.to_thread(_cookie_path)
     names = set()
     if cp:
         try:
@@ -300,7 +355,7 @@ async def diag(url: str = Query("https://www.youtube.com/watch?v=dQw4w9WgXcQ")):
     key_cookies = ["LOGIN_INFO", "SAPISID", "__Secure-3PSID", "__Secure-1PSID", "SID", "HSID"]
     out = {
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "?"),
-        "cookies_file": COOKIES_FILE, "cookies_loaded": bool(cp), "cookie_count": len(names),
+        "cookies_source": _COOKIES_SRC or None, "cookies_loaded": bool(cp), "cookie_count": len(names),
         "login_cookies_present": {k: (k in names) for k in key_cookies},
         "proxy_configured": bool(PROXY), "attempts": [],
     }
