@@ -187,6 +187,17 @@ _RETRY_HINTS = ("not playable", "forbidden", "sign in", "not a bot", "confirm yo
                 "requested format", "unavailable", "player response")
 
 
+def _ping_pot() -> str:
+    """Is the PO-token provider reachable? (bgutil exposes GET /ping)"""
+    if not POT_BASE_URL:
+        return "not configured (set POT_BASE_URL)"
+    try:
+        r = httpx.get(POT_BASE_URL.rstrip("/") + "/ping", timeout=8)
+        return f"ok: {r.text[:120]}" if r.status_code == 200 else f"HTTP {r.status_code}"
+    except Exception as e:  # noqa: BLE001
+        return f"unreachable: {str(e)[:100]}"
+
+
 def _probe_playable(info: dict) -> "tuple[bool, str]":
     """Request 2 bytes of the best direct audio URL: googlevideo answers 403 when a client needs a PO token."""
     raws = [f for f in info.get("formats") or [] if f.get("url") and f.get("vcodec") in (None, "none")
@@ -384,7 +395,7 @@ async def diag(url: str = Query("https://www.youtube.com/watch?v=dQw4w9WgXcQ")):
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "?"),
         "cookies_source": _COOKIES_SRC or None, "cookies_loaded": bool(cp), "cookie_count": len(names),
         "login_cookies_present": {k: (k in names) for k in key_cookies},
-        "proxy_configured": bool(PROXY), "pot_provider": POT_BASE_URL or None, "js_runtime": JS_RUNTIME or "MISSING - install deno (see Dockerfile)", "attempts": [],
+        "proxy_configured": bool(PROXY), "pot_provider": POT_BASE_URL or None, "pot_provider_ping": await asyncio.to_thread(_ping_pot), "js_runtime": JS_RUNTIME or "MISSING - install deno (see Dockerfile)", "attempts": [],
     }
     def run(n):
         try:
