@@ -202,6 +202,14 @@ _RETRY_HINTS = ("not playable", "forbidden", "sign in", "not a bot", "confirm yo
                 "requested format", "unavailable", "player response")
 
 
+def _pot_plugin_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("bgutil-ytdlp-pot-provider")
+    except Exception:  # noqa: BLE001
+        return "NOT INSTALLED (add bgutil-ytdlp-pot-provider to requirements.txt)"
+
+
 def _ping_pot() -> str:
     """Is the PO-token provider reachable? (bgutil exposes GET /ping)"""
     if not POT_BASE_URL:
@@ -429,16 +437,45 @@ async def diag(url: str = Query("https://www.youtube.com/watch?v=dQw4w9WgXcQ")):
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "?"),
         "cookies_source": _COOKIES_SRC or None, "cookies_loaded": bool(cp), "cookie_count": len(names),
         "login_cookies_present": {k: (k in names) for k in key_cookies},
-        "proxy_configured": bool(PROXY), "pot_provider": POT_BASE_URL or None, "pot_provider_ping": await asyncio.to_thread(_ping_pot), "egress_ip_samples": await asyncio.to_thread(_egress_ips), "js_runtime": JS_RUNTIME or "MISSING - install deno (see Dockerfile)", "attempts": [],
+        "proxy_configured": bool(PROXY), "pot_provider": POT_BASE_URL or None, "pot_plugin": _pot_plugin_version(), "pot_provider_ping": await asyncio.to_thread(_ping_pot), "egress_ip_samples": await asyncio.to_thread(_egress_ips), "js_runtime": JS_RUNTIME or "MISSING - install deno (see Dockerfile)", "attempts": [],
     }
     def run(n):
+        import re
+        from urllib.parse import urlsplit, parse_qs
+        lines: list = []
+
+        class Cap:                       # capture only PO-token / plugin related yt-dlp debug output
+            def debug(self, m):
+                if re.search(r"pot|bgutil|plugin|po token", str(m), re.I) and len(lines) < 14:
+                    lines.append(str(m)[:200])
+            def info(self, m): pass
+            def warning(self, m):
+                if len(lines) < 14: lines.append("W " + str(m)[:200])
+            def error(self, m):
+                if len(lines) < 14: lines.append("E " + str(m)[:200])
+        res = {"client": _VARIANTS[n]["name"]}
         try:
-            with yt_dlp.YoutubeDL(_get_ydl_opts(None, n)) as ydl:
+            with yt_dlp.YoutubeDL(_get_ydl_opts({"ignore_no_formats_error": True, "logger": Cap(), "verbose": True}, n)) as ydl:
                 info = ydl.extract_info(url, download=False)
-            ok, why = _probe_playable(info)
-            return {"client": _VARIANTS[n]["name"], "ok": ok, "audio_formats": len(extract_audio_formats(info)), "media_url": why}
+                ok, why = _probe_playable(info)
+                res.update(ok=ok, audio_formats=len(extract_audio_formats(info)), media_url=why)
+                raws = [f for f in info.get("formats") or [] if f.get("url") and f.get("vcodec") in (None, "none")
+                        and f.get("acodec") not in (None, "none") and "m3u8" not in str(f.get("protocol", ""))]
+                if raws:
+                    f = max(raws, key=lambda x: x.get("abr") or 0)
+                    q = parse_qs(urlsplit(f["url"]).query)
+                    res["url_has_pot"] = "pot" in q
+                    res["url_client"] = (q.get("c") or ["?"])[0]
+                    h = dict(f.get("http_headers") or {}); h["Range"] = "bytes=0-1"
+                    try:   # same URL through yt-dlp's OWN HTTP stack (different TLS/headers than httpx)
+                        from yt_dlp.networking import Request as YReq
+                        r = ydl.urlopen(YReq(f["url"], headers=h)); res["yt_dlp_own_http"] = f"HTTP {r.status}"; r.close()
+                    except Exception as e:  # noqa: BLE001
+                        res["yt_dlp_own_http"] = f"{type(e).__name__}: {str(e)[:90]}"
         except Exception as e:  # noqa: BLE001
-            return {"client": _VARIANTS[n]["name"], "ok": False, "error": str(e)[:200]}
+            res.update(ok=False, error=str(e)[:200])
+        res["yt_dlp_log"] = lines
+        return res
     for n in range(len(_VARIANTS)):
         out["attempts"].append(await asyncio.to_thread(run, n))
     ping = out["pot_provider_ping"]
