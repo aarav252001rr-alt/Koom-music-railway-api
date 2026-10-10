@@ -104,6 +104,7 @@ GH_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 GH_REFRESH = int(os.getenv("COOKIES_REFRESH_SECONDS", "1800"))
 GH_ALLOW_PUBLIC = os.getenv("COOKIES_ALLOW_PUBLIC", "") == "1"
 
+JS_RUNTIME = shutil.which("deno") or shutil.which("node") or ""
 _COOKIES_RUNTIME: Optional[str] = None   # None = not loaded yet, "" = none available
 _COOKIES_T = 0.0
 _COOKIES_SRC = ""
@@ -214,10 +215,11 @@ def _extract(url: str, extra: Optional[dict] = None) -> dict:
     last: Optional[Exception] = None
     for n in order:
         try:
-            with yt_dlp.YoutubeDL(_get_ydl_opts(extra, n)) as ydl:
+            with yt_dlp.YoutubeDL(_get_ydl_opts(extra if extra is not None else {"ignore_no_formats_error": True}, n)) as ydl:
                 info = ydl.extract_info(url, download=False)
             if extra is None and not extract_audio_formats(info):
-                raise RuntimeError("no audio formats returned by this client")
+                raise RuntimeError("no audio formats returned by this client" + ("" if JS_RUNTIME else
+                                   " - NO JavaScript runtime installed (deno/node): YouTube formats cannot be unlocked"))
             if n != _VARIANT:
                 logger.info("yt-dlp client switched to %s", _VARIANTS[n]["name"])
             _VARIANT = n
@@ -357,7 +359,7 @@ async def diag(url: str = Query("https://www.youtube.com/watch?v=dQw4w9WgXcQ")):
         "yt_dlp_version": getattr(yt_dlp.version, "__version__", "?"),
         "cookies_source": _COOKIES_SRC or None, "cookies_loaded": bool(cp), "cookie_count": len(names),
         "login_cookies_present": {k: (k in names) for k in key_cookies},
-        "proxy_configured": bool(PROXY), "attempts": [],
+        "proxy_configured": bool(PROXY), "js_runtime": JS_RUNTIME or "MISSING - install deno (see Dockerfile)", "attempts": [],
     }
     def run(n):
         try:
@@ -540,6 +542,10 @@ async def download_file(token: str):
 @app.on_event("startup")
 async def startup_cleanup():
     logger.info("KOOM Downloader API v2 started")
+    if not JS_RUNTIME:
+        logger.error("No JavaScript runtime (deno/node) found - YouTube extraction will fail with \"Requested format is not available\". Install deno.")
+    else:
+        logger.info("JS runtime: %s", JS_RUNTIME)
 
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException):
