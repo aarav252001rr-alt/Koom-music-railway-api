@@ -332,6 +332,10 @@ def _extract(url: str, extra: Optional[dict] = None) -> dict:
             logger.warning("yt-dlp client %s failed for %s: %s", _VARIANTS[n]["name"], url, str(e)[:260])
             if not any(h in str(e).lower() for h in _RETRY_HINTS):
                 raise
+    msg = str(last)
+    if "not a bot" in msg.lower() or "sign in" in msg.lower():
+        raise RuntimeError(f"YouTube bot-check on this server's IP (cookies {'loaded' if have_cookies else 'NOT loaded'}). "
+                           "Add cookies from a fresh Google account or use a proxy (YTDLP_PROXY). Details: " + msg[:220])
     raise last  # type: ignore[misc]
 
 
