@@ -31,7 +31,19 @@ DOWNLOAD_TTL = int(os.getenv("DOWNLOAD_TTL", "900"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp/koom-downloads")
-POT_BASE_URL = os.getenv("POT_BASE_URL", "").strip()      # optional bgutil PO-token provider, e.g. http://pot.railway.internal:4416
+def _norm_pot_url(u: str) -> str:
+    """Railway public domains are served on https:443 only - ':4416' on *.up.railway.app just times out."""
+    u = u.strip().rstrip("/")
+    if not u:
+        return ""
+    from urllib.parse import urlsplit
+    p = urlsplit(u if "://" in u else "http://" + u)
+    if (p.hostname or "").endswith(".up.railway.app"):
+        return f"https://{p.hostname}"
+    return u
+
+
+POT_BASE_URL = _norm_pot_url(os.getenv("POT_BASE_URL", ""))      # optional bgutil PO-token provider, e.g. http://pot.railway.internal:4416
 PROXY = os.getenv("YTDLP_PROXY", "").strip()          # optional: http(s)/socks5 proxy for YouTube (residential works best)
 EXTRA_CLIENTS = [c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") if c.strip()]
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -407,8 +419,14 @@ async def diag(url: str = Query("https://www.youtube.com/watch?v=dQw4w9WgXcQ")):
             return {"client": _VARIANTS[n]["name"], "ok": False, "error": str(e)[:200]}
     for n in range(len(_VARIANTS)):
         out["attempts"].append(await asyncio.to_thread(run, n))
-    out["verdict"] = ("works" if any(x["ok"] for x in out["attempts"]) else
-                      "all clients blocked: YouTube is rejecting this server's IP/cookies (use a proxy or run the API from a home/VPS IP)")
+    ping = out["pot_provider_ping"]
+    if any(x["ok"] for x in out["attempts"]):
+        out["verdict"] = "works"
+    elif not POT_BASE_URL or not ping.startswith("ok"):
+        out["verdict"] = ("PO token provider is not reachable - fix POT_BASE_URL first "
+                          "(Railway public domain: https://<name>.up.railway.app with NO port; or http://<service>.railway.internal:4416)")
+    else:
+        out["verdict"] = "provider reachable but every client is still blocked: YouTube is rejecting this server's IP/cookies (try a proxy or a home/VPS IP)"
     return out
 
 
