@@ -46,7 +46,7 @@ def _norm_pot_url(u: str) -> str:
 POT_BASE_URL = _norm_pot_url(os.getenv("POT_BASE_URL", ""))      # optional bgutil PO-token provider, e.g. http://pot.railway.internal:4416
 # googlevideo URLs are bound to the IP that created them; Railway's outbound IP rotates within a small pool, so a
 # 403 is often just "different egress IP". A fresh connection may leave from the right one - retry a few times.
-EGRESS_RETRIES = max(1, int(os.getenv("EGRESS_RETRIES", "8")))
+EGRESS_RETRIES = max(1, int(os.getenv("EGRESS_RETRIES", "3")))
 PROXY = os.getenv("YTDLP_PROXY", "").strip()          # optional: http(s)/socks5 proxy for YouTube (residential works best)
 EXTRA_CLIENTS = [c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") if c.strip()]
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -156,6 +156,8 @@ def _fetch_github_cookies() -> Optional[bytes]:
 def _cookie_path() -> Optional[str]:
     """Path of a private, writable cookies copy, or None. Never raises: cookie problems must not break playback."""
     global _COOKIES_RUNTIME, _COOKIES_T, _COOKIES_SRC
+    if os.getenv("COOKIES_DISABLED", "") == "1":   # run fully cookie-less (also never contacts GitHub)
+        return None
     with _COOKIES_LOCK:
         if _COOKIES_RUNTIME is not None and not (GH_REPO and time.time() - _COOKIES_T > GH_REFRESH):
             return _COOKIES_RUNTIME or None
@@ -191,18 +193,16 @@ def _cookie_path() -> Optional[str]:
 # YouTube often answers "Sign in to confirm you're not a bot" to datacenter IPs. Different yt-dlp
 # player clients are treated differently, so we try several and remember the one that works.
 _VARIANTS = ([{"name": "env:" + ",".join(EXTRA_CLIENTS), "args": {"youtube": {"player_client": EXTRA_CLIENTS}}, "cookies": True}] if EXTRA_CLIENTS else []) + [
+    # Verified on Railway via /diag: logged-in cookies put the account in YouTube's SABR-only experiment (direct URLs
+    # 403), while these two cookie-less clients return playable URLs (HTTP 206). They go first.
+    {"name": "tv_simply", "args": {"youtube": {"player_client": ["tv_simply"]}}, "cookies": False},
+    {"name": "default-nocookie", "args": None, "cookies": False},
+    {"name": "mweb-nocookie", "args": {"youtube": {"player_client": ["mweb"]}}, "cookies": False},
+    # cookie-based clients stay as a last-resort fallback (e.g. if YouTube starts demanding sign-in again)
     {"name": "default", "args": None, "cookies": True},
     {"name": "mweb", "args": {"youtube": {"player_client": ["mweb"]}}, "cookies": True},
-    {"name": "web", "args": {"youtube": {"player_client": ["web"]}}, "cookies": True},
-    # Logged-in accounts can be put in YouTube's "SABR-only" experiment (direct URLs then 403). A logged-out
-    # session is not part of that, and PO tokens come from the bgutil provider - so try cookie-less too.
-    {"name": "mweb-nocookie", "args": {"youtube": {"player_client": ["mweb"]}}, "cookies": False},
-    {"name": "web-nocookie", "args": {"youtube": {"player_client": ["web"]}}, "cookies": False},
-    {"name": "default-nocookie", "args": None, "cookies": False},
-    {"name": "tv_simply", "args": {"youtube": {"player_client": ["tv_simply"]}}, "cookies": False},
     {"name": "web_creator", "args": {"youtube": {"player_client": ["web_creator"]}}, "cookies": True},
     {"name": "tv", "args": {"youtube": {"player_client": ["tv"]}}, "cookies": True},
-    {"name": "web_safari", "args": {"youtube": {"player_client": ["web_safari"]}}, "cookies": True},
     {"name": "android_vr", "args": {"youtube": {"player_client": ["android_vr"]}}, "cookies": False},
 ]
 _VARIANT = 0
