@@ -410,14 +410,24 @@ def extract_audio_formats(info: dict) -> List[Dict[str, Any]]:
 
 
 def find_format(info: dict, format_id: str) -> Optional[dict]:
+    """Resolve an exact itag ("251") or a preset: best | high | standard | low, optionally with an
+    extension preference: "high-m4a", "low-webm", or just "m4a" / "webm" (opus == webm)."""
     formats = extract_audio_formats(info)
-    fid = format_id.lower()
-    if fid in {"best", "auto", "highest", "high"}:
-        return formats[0] if formats else None
-    if formats and fid in {"standard", "medium"}:
-        return formats[len(formats) // 2]
-    if formats and fid in {"low", "lowest"}:
-        return formats[-1]
+    if not formats:
+        return None
+    fid = format_id.lower().strip()
+    level, _, ext = fid.partition("-")
+    if level in {"m4a", "webm", "opus"} and not ext:
+        level, ext = "best", level
+    if level in {"best", "auto", "highest", "high", "standard", "medium", "low", "lowest"}:
+        ext = "webm" if ext == "opus" else ext
+        pool = [f for f in formats if f.get("ext") == ext] if ext in {"m4a", "webm"} else []
+        pool = pool or formats                      # no such container for this video -> fall back to all
+        if level in {"standard", "medium"}:
+            return pool[len(pool) // 2]
+        if level in {"low", "lowest"}:
+            return pool[-1]
+        return pool[0]
     return next((f for f in formats if f["format_id"] == format_id), None)
 
 
