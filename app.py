@@ -11,7 +11,6 @@ import logging
 import tempfile
 import shutil
 import threading
-import subprocess
 from pathlib import Path   # FIX: was missing -> /download/{token} crashed with NameError
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -453,7 +452,7 @@ async def _extract_direct(url: str, format_id: str) -> tuple[dict, dict]:
 
 @app.get("/")
 async def root():
-    return {"name": "KOOM Downloader API", "version": "2.0.0", "docs": "/docs", "features": ["best audio", "real source quality", "stream", "WebM to Ogg Opus remux", "M4A container preservation", "metadata and lyrics tagging", "cover art for M4A"]}
+    return {"name": "KOOM Downloader API", "version": "2.0.0", "docs": "/docs", "features": ["best audio", "real source quality", "stream", "metadata downloads", "cover art", "ID3/M4A tags"]}
 
 @app.get("/health")
 async def health():
@@ -562,34 +561,37 @@ async def formats(url: str = Query(...)):
 
 @app.post("/stream", response_model=StreamResponse, dependencies=[Depends(verify_key)])
 async def create_stream(req: StreamRequest, request: Request):
-    """Create a processed stream: WebM audio is remuxed to .opus; M4A remains M4A."""
     url = str(req.url)
     if "youtube.com" not in url and "youtu.be" not in url:
         raise HTTPException(400, "Only YouTube URLs allowed")
+    # Conversion intentionally disabled: always preserve yt-dlp's actual source format.
     try:
         data = await asyncio.to_thread(fetch_video_info, url)
     except Exception as e:
         raise HTTPException(422, f"Extraction failed: {str(e)[:300]}")
     selected = find_format(data, req.format_id)
     if not selected:
-        raise HTTPException(400, f"Audio format '{req.format_id}' is not available. Use format_id='best'.")
-    source_ext = selected["ext"].lower()
-    output_fmt = "opus" if source_ext == "webm" else ("m4a" if source_ext in ("m4a", "mp4") else source_ext)
+        raise HTTPException(400, f"Audio format '{req.format_id}' is not available. Use format_id='best' for highest available audio.")
     token = secrets.token_urlsafe(24)
     title = data.get("title") or "audio"
+    ext = selected["ext"]
+    filename = _clean_filename(title, ext)
     TOKENS[token] = {
-        "type": "stream", "url": url, "format_id": selected["format_id"],
-        "ext": output_fmt, "source_ext": source_ext, "output_fmt": output_fmt,
-        "expires": time.time() + STREAM_TTL, "title": title,
+        "type": "stream", "url": url, "format_id": selected["format_id"], "ext": selected["ext"],
+        "convert_to": None, "expires": time.time() + STREAM_TTL, "title": title,
         "artist": _artist(data), "album": _album(data), "thumbnail": data.get("thumbnail"),
         "duration": data.get("duration"), "track": data.get("track") or title,
-        "file": None,
     }
+    # We already hold the playable googlevideo URL from this extraction: hand it to GET /stream/{token}
+    # so it does not run yt-dlp two more times (this cut ~6 s from the start of every song).
+    raw = next((f for f in data.get("formats") or [] if str(f.get("format_id")) == selected["format_id"] and f.get("url")), None)
+    if raw:
+        TOKENS[token]["direct"] = {"t": time.time(), "url": raw["url"], "ext": selected["ext"],
+                                   "h": raw.get("http_headers") or data.get("http_headers") or {}}
     b = base_url(request)
     return StreamResponse(
-        stream_url=f"{b}/stream/{token}", expires_in=STREAM_TTL,
-        format_id=selected["format_id"], ext=output_fmt, convert_to=output_fmt,
-        token=token, filename=_clean_filename(title, output_fmt),
+        stream_url=f"{b}/stream/{token}", expires_in=STREAM_TTL, format_id=selected["format_id"], ext=selected["ext"],
+        convert_to=None, token=token, filename=filename,
     )
 
 @app.get("/stream/{token}")
@@ -598,13 +600,13 @@ async def proxy_stream(token: str, request: Request):
     if not item or item.get("expires", 0) < time.time():
         TOKENS.pop(token, None)
         raise HTTPException(410, "Stream expired or not found")
-    # Serve the same fully tagged output used by download, including Range/seek support.
-    if not item.get("file") or not os.path.isfile(item["file"]):
-        item["file"] = await _download_tagged(item, item["output_fmt"])
-    path = item["file"]
-    mime = {"opus":"audio/ogg", "m4a":"audio/mp4", "mp3":"audio/mpeg", "ogg":"audio/ogg"}.get(item["output_fmt"], "application/octet-stream")
-    return FileResponse(path, media_type=mime, filename=_clean_filename(item["title"], item["output_fmt"]),
-                        content_disposition_type="inline", headers={"Cache-Control":"no-store"})
+    # Reuse the resolved googlevideo URL for a few minutes: browsers send several Range requests per
+    # track (seeking), and re-running yt-dlp for each one made playback slow to start.
+    hit = item.get("direct")
+    if not hit or hit["t"] < time.time() - 240:
+        _, selected = await _extract_direct(item["url"], item["format_id"])
+        hit = item["direct"] = {"t": time.time(), "url": selected["url"], "ext": selected["ext"], "h": selected.get("http_headers") or {}}
+    return await _proxy_bytes(hit["url"], hit["ext"], request, item["title"], download=False, upstream_headers=hit["h"])
 
 async def _proxy_bytes(direct_url: str, ext: str, request: Request, title: str, download: bool = False,
                        upstream_headers: Optional[dict] = None):
@@ -637,124 +639,10 @@ async def _proxy_bytes(direct_url: str, ext: str, request: Request, title: str, 
 _THUMB_OK = {"mp3", "m4a", "mp4", "m4v", "mov", "ogg", "opus", "flac", "mka", "mkv"}
 
 
-def _fetch_lyrics(item: dict) -> str:
-    """Best-effort lyrics lookup from LRCLIB; returns plain or synced lyrics."""
-    title = str(item.get("title") or "").strip()
-    artist = str(item.get("artist") or "").strip()
-    album = str(item.get("album") or "").strip()
-    if not title:
-        return ""
-    try:
-        params = {"track_name": title, "artist_name": artist}
-        if album and album.lower() != "unknown album":
-            params["album_name"] = album
-        if item.get("duration"):
-            params["duration"] = int(item["duration"])
-        r = httpx.get("https://lrclib.net/api/get", params=params,
-                      headers={"User-Agent":"KOOM Downloader/2.1 (audio metadata)"},
-                      timeout=8, follow_redirects=True)
-        if r.status_code == 200:
-            data = r.json()
-            return str(data.get("syncedLyrics") or data.get("plainLyrics") or "").strip()
-    except Exception as e:
-        logger.info("Lyrics lookup unavailable: %s", str(e)[:120])
-    # Search fallback, then select a close title/artist match.
-    try:
-        r = httpx.get("https://lrclib.net/api/search",
-                      params={"track_name": title, "artist_name": artist},
-                      headers={"User-Agent":"KOOM Downloader/2.1 (audio metadata)"},
-                      timeout=8, follow_redirects=True)
-        if r.status_code == 200:
-            candidates = r.json()
-            if isinstance(candidates, list) and candidates:
-                target = re.sub(r"[^a-z0-9]", "", title.lower())
-                def score(x):
-                    t = re.sub(r"[^a-z0-9]", "", str(x.get("trackName") or "").lower())
-                    a = re.sub(r"[^a-z0-9]", "", str(x.get("artistName") or "").lower())
-                    return (t == target, bool(artist and artist.lower() in str(x.get("artistName") or "").lower()),
-                            bool(x.get("syncedLyrics")), bool(x.get("plainLyrics")))
-                best = max(candidates, key=score)
-                return str(best.get("syncedLyrics") or best.get("plainLyrics") or "").strip()
-    except Exception as e:
-        logger.info("Lyrics search unavailable: %s", str(e)[:120])
-    return ""
-
-
-def _run_ffmpeg_tag(source: str, output: str, item: dict, lyrics: str, output_fmt: str):
-    """Remux WebM/Opus into Ogg Opus without re-encoding when possible; preserve M4A audio/container."""
-    title = str(item.get("title") or "audio")
-    artist = str(item.get("artist") or "Unknown Artist")
-    album = str(item.get("album") or "Unknown Album")
-    track = str(item.get("track") or title)
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", source]
-    thumb = item.get("thumbnail")
-    # Attach cover where the destination container supports it. Failure to fetch art must not block audio.
-    cover_path = None
-    if thumb and output_fmt == "m4a":
-        try:
-            r = httpx.get(thumb, timeout=10, follow_redirects=True)
-            if r.status_code == 200 and r.content:
-                cover_path = source + ".cover.jpg"
-                with open(cover_path, "wb") as f:
-                    f.write(r.content)
-                cmd += ["-i", cover_path]
-        except Exception:
-            cover_path = None
-    cmd += ["-map", "0:a:0"]
-    if cover_path:
-        cmd += ["-map", "1:v:0", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic"]
-    cmd += ["-map_metadata", "-1", "-metadata", f"title={title}",
-            "-metadata", f"artist={artist}", "-metadata", f"album={album}",
-            "-metadata", f"track={track}"]
-    if lyrics:
-        # Vorbis comments work for Ogg Opus; ffmpeg writes lyrics metadata to supported muxers.
-        cmd += ["-metadata", f"lyrics={lyrics}", "-metadata", f"unsyncedlyrics={lyrics}"]
-    if output_fmt == "opus":
-        # WebM Opus -> Ogg Opus is a lossless container remux. Other codecs must be encoded to Opus.
-        try:
-            probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
-                                    "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1", source],
-                                   capture_output=True, text=True, timeout=10)
-            codec = probe.stdout.strip().splitlines()[0] if probe.stdout.strip() else ""
-        except Exception:
-            codec = ""
-        cmd += ["-c:a", "copy" if codec == "opus" else "libopus", "-b:a", "160k", "-f", "opus", output]
-    elif output_fmt == "m4a":
-        cmd += ["-c:a", "copy", "-movflags", "+faststart", output]
-    else:
-        cmd += ["-c:a", "copy", output]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        if proc.returncode != 0:
-            raise RuntimeError((proc.stderr or "ffmpeg tagging failed")[-900:])
-        # Mutagen writes container-native lyrics tags more reliably than ffmpeg metadata mapping.
-        if lyrics:
-            try:
-                from mutagen.oggopus import OggOpus
-                from mutagen.mp4 import MP4
-                if output_fmt == "opus":
-                    audio = OggOpus(output)
-                    audio["LYRICS"] = lyrics
-                    audio["UNSYNCEDLYRICS"] = lyrics
-                    audio.save()
-                elif output_fmt == "m4a":
-                    audio = MP4(output)
-                    if audio.tags is None:
-                        audio.add_tags()
-                    audio.tags["\xa9lyr"] = [lyrics]
-                    audio.save()
-            except Exception as tag_error:
-                logger.warning("Native lyrics tag embedding failed: %s", str(tag_error)[:160])
-    finally:
-        if cover_path and os.path.exists(cover_path):
-            os.remove(cover_path)
-
-
 async def _download_tagged(item: dict, output_fmt: str) -> str:
-    """Download source audio, then produce tagged .opus or metadata-enriched original M4A."""
+    """Download the chosen yt-dlp format as-is, then embed metadata/cover when supported."""
     work = tempfile.mkdtemp(prefix="koom-")
     try:
-        source_ext = str(item.get("source_ext") or item.get("output_fmt") or output_fmt).lower()
         outtmpl = os.path.join(work, "source.%(ext)s")
         opts = _get_ydl_opts({
             "skip_download": False,
@@ -762,29 +650,36 @@ async def _download_tagged(item: dict, output_fmt: str) -> str:
             "format": item["format_id"],
             "outtmpl": outtmpl,
             "noplaylist": True,
-            "writethumbnail": False,
-            "postprocessors": [],
+            # yt-dlp can only embed cover art into these containers; WebM (Opus) is NOT one of them.
+            "writethumbnail": item.get("output_fmt") in _THUMB_OK,
+            "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True}] +
+                              ([{"key": "EmbedThumbnail"}] if item.get("output_fmt") in _THUMB_OK else []),
         })
-        await asyncio.to_thread(lambda: _download_with_ydl(item["url"], opts))
-        candidates = [p for p in Path(work).glob("source.*") if p.is_file()
-                      and not p.name.endswith((".jpg", ".jpeg", ".png", ".webp", ".json", ".cover.jpg"))]
+        # Run yt-dlp's own downloader rather than fetching googlevideo URLs separately.
+        try:
+            await asyncio.to_thread(lambda: _download_with_ydl(item["url"], opts))
+        except Exception as e:  # noqa: BLE001
+            if "postprocess" not in str(e).lower():
+                raise
+            # Tagging/cover embedding failed but the audio is fine: retry as a plain download.
+            logger.warning("Post-processing failed (%s) - retrying without tags", str(e)[:120])
+            for f in Path(work).glob("*"):
+                f.unlink(missing_ok=True)
+            opts.pop("postprocessors", None); opts["writethumbnail"] = False
+            await asyncio.to_thread(lambda: _download_with_ydl(item["url"], opts))
+        candidates = [p for p in Path(work).glob("source.*") if p.is_file() and not p.name.endswith((".jpg", ".jpeg", ".png", ".webp", ".json"))]
         if not candidates:
             raise HTTPException(502, "yt-dlp did not produce an audio file")
         source = max(candidates, key=lambda p: p.stat().st_size)
-        lyrics = await asyncio.to_thread(_fetch_lyrics, item)
-        final_ext = "opus" if source_ext == "webm" else ("m4a" if source_ext in ("m4a", "mp4") else output_fmt)
-        final_name = _clean_filename(item.get("title") or "audio", final_ext)
+        final_name = _clean_filename(item.get("title") or "audio", source.suffix.lstrip(".") or "webm")
         final = os.path.join(DOWNLOAD_DIR, secrets.token_hex(12) + "-" + final_name)
-        await asyncio.to_thread(_run_ffmpeg_tag, str(source), final, item, lyrics, final_ext)
-        if not os.path.isfile(final) or os.path.getsize(final) == 0:
-            raise HTTPException(502, "Audio processing produced an empty file")
-        logger.info("Prepared %s (%s), lyrics=%s", final_name, final_ext, bool(lyrics))
+        shutil.move(str(source), final)
         return final
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Audio processing failed")
-        raise HTTPException(502, f"Audio processing failed: {str(e)[:300]}")
+        logger.exception("Native yt-dlp download failed")
+        raise HTTPException(502, f"yt-dlp download failed: {str(e)[:250]}")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -802,14 +697,13 @@ async def create_download(req: StreamRequest, request: Request):
     except Exception as e: raise HTTPException(422, f"Extraction failed: {str(e)[:300]}")
     selected = find_format(data, req.format_id)
     if not selected: raise HTTPException(400, f"Audio format '{req.format_id}' is not available. Use 'best'.")
-    # WebM audio is delivered as Ogg Opus; M4A remains M4A with tags/lyrics.
-    source_ext = selected["ext"].lower()
-    output_fmt = "opus" if source_ext == "webm" else ("m4a" if source_ext in ("m4a", "mp4") else source_ext)
+    # Source-format downloads only. convert_to is accepted for old clients but ignored.
+    output_fmt = selected["ext"]
     token = secrets.token_urlsafe(24)
     title = data.get("title") or "audio"
-    TOKENS[token] = {"type":"download","url":url,"format_id":selected["format_id"],"expires":time.time()+DOWNLOAD_TTL,"title":title,"artist":_artist(data),"album":_album(data),"thumbnail":data.get("thumbnail"),"track":data.get("track") or title,"output_fmt":output_fmt,"source_ext":source_ext,"duration":data.get("duration"),"file":None}
+    TOKENS[token] = {"type":"download","url":url,"format_id":selected["format_id"],"expires":time.time()+DOWNLOAD_TTL,"title":title,"artist":_artist(data),"album":_album(data),"thumbnail":data.get("thumbnail"),"track":data.get("track") or title,"output_fmt":output_fmt,"file":None}
     b = base_url(request)
-    return {"download_url":f"{b}/download/{token}","stream_url":f"{b}/download/{token}","expires_in":DOWNLOAD_TTL,"format_id":selected["format_id"],"source_quality":selected["quality_label"],"output_format":output_fmt,"source_format":source_ext,"filename":_clean_filename(title,output_fmt),"lyrics_embedded": "best-effort on file preparation","title":title,"artist":_artist(data),"album":_album(data),"thumbnail":data.get("thumbnail")}
+    return {"download_url":f"{b}/download/{token}","stream_url":f"{b}/download/{token}","expires_in":DOWNLOAD_TTL,"format_id":selected["format_id"],"source_quality":selected["quality_label"],"output_format":output_fmt,"filename":_clean_filename(title,output_fmt),"title":title,"artist":_artist(data),"album":_album(data),"thumbnail":data.get("thumbnail")}
 
 @app.get("/download/{token}")
 async def download_file(token: str):
