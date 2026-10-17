@@ -1,6 +1,6 @@
 fastapi==0.115.0
 uvicorn[standard]>=0.30.0
-yt-dlp[default]
+yt-dlp[default]>=2026.08.19
 deno
 httpx>=0.27.0
 bgutil-ytdlp-pot-provider
